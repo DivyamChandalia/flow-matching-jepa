@@ -68,11 +68,15 @@ Taken together, a one-step autoregressive flow (Experiment D) and a one-shot mul
 
 ## What I think is happening
 
-When the encoder trains with the flow objective, nothing stops the latent space from drifting toward something the flow can match without using the actions. A frozen encoder removes that freedom. The flow then has a fixed target it can only fit by using its conditioning.
+These are hypotheses, not tested results. I see two problems, and both point to joint training rather than the predictor.
+
+**1. The flow is matching a distribution that keeps moving.** Flow matching learns a map between two fixed distributions: noise and data. It is normally trained on frozen representations, which is also how Flow-JEPA trains its Push-T model. Here the target distribution changes as the encoder learns, and SIGReg keeps pulling the latents apart toward an isotropic Gaussian. The flow is chasing a target that is still being reshaped, so it has no stable mapping to learn. A frozen encoder fixes the target distribution, which matches Experiment A being the one configuration that worked.
+
+**2. The data starts to look like the noise.** SIGReg pushes the latents toward the same standard Gaussian that flow matching draws its noise from. When the target distribution and the noise distribution are nearly the same, the predictor can lower its loss by producing any plausible sample from that Gaussian, without needing the action. The latent-target flow head is consistent with this: it ends up predicting the SIGReg Gaussian marginal instead of the conditioned next state ([`results.md`](results.md)). This argument is about the distributions, not the parameterization, which fits the collapse appearing with both x-prediction and v-prediction.
 
 ## Next
 
-- **EMA target encoder.** A frozen encoder works, but it needs a pretrained model first, which is what joint training was meant to avoid. If embedding drift is what breaks joint training, a slowly updated target encoder may sit between "frozen" and "fully joint". Planned, not yet run.
+- **EMA target encoder.** A frozen encoder works, but it needs a pretrained model first, which is what joint training was meant to avoid. If the moving target (problem 1) is what breaks joint training, a slowly updated target encoder may sit between "frozen" and "fully joint". Planned, not yet run.
 - **x-prediction with a full, jointly trained flow transformer.** My x-prediction runs used a small head and my full-transformer runs used v-prediction, so this combination is untested. The x-prediction head also lost action conditioning when trained jointly, so I don't expect it to fix the collapse on its own.
 - Frozen-encoder Flow-JEPA on Push-T with its MPC planning evaluation, a fair replication of its claim.
 - Joint-from-scratch on a simpler environment (Two-Room) to test whether the collapse is specific to Push-T.
