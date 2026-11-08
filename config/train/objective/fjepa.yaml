@@ -1,0 +1,4 @@
+name: fjepa
+num_flow_steps: 8
+source: standard_noise # standard_noise | noisy_current
+source_noise_scale: 1.0

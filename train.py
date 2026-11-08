@@ -119,6 +119,58 @@ def flow_forward(self, batch, stage, cfg):
     return output
 
 
+def flow_transformer_forward(self, batch, stage, cfg):
+    """Joint encoder + full-transformer flow training from scratch.
+
+    The predictor IS the flow model: v(noisy, hist_emb, hist_act, t).
+    Encoder gradients flow through both target and history latents (no detach).
+    Loss = flow_loss + sigreg (no AR MSE loss).
+    """
+    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+    output = self.model.encode(batch)
+    emb = output["emb"]
+    act_emb = output["act_emb"]
+    hist_emb = emb[:, :cfg.history_size]
+    hist_act = act_emb[:, :cfg.history_size]
+    target_emb = emb[:, 1:cfg.history_size + 1]
+
+    flow_loss = self.model.flow_loss(hist_emb, hist_act, target_emb)
+    output["flow_loss"] = flow_loss.detach()
+
+    lambd = cfg.loss.sigreg.weight
+    output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
+    output["loss"] = flow_loss + lambd * output["sigreg_loss"]
+    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    return output
+
+
+def fjepa_forward(self, batch, stage, cfg):
+    """Faithful Flow-JEPA training: joint H=1 -> P trajectory flow + SIGReg.
+
+    future actions act[:, H-1:H-1+P], targets emb[:, H:H+P]. No AR loss.
+    """
+    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+    output = self.model.encode(batch)
+    emb = output["emb"]
+    act_emb = output["act_emb"]
+    H = cfg.history_size
+    P = cfg.num_preds
+    hist_emb = emb[:, :H]
+    future_act = act_emb[:, H - 1:H - 1 + P]
+    target_emb = emb[:, H:H + P]
+
+    flow_loss = self.model.flow_loss(hist_emb, future_act, target_emb)
+    output["flow_loss"] = flow_loss.detach()
+
+    lambd = cfg.loss.sigreg.weight
+    output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
+    output["loss"] = flow_loss + lambd * output["sigreg_loss"]
+    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    return output
+
+
 def shortcut_forward(self, batch, stage, cfg):
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
     output = self.model.encode(batch)
@@ -285,6 +337,10 @@ def run(cfg):
         forward_fn = lewm_forward
     elif objective_name == "flow":
         forward_fn = flow_forward
+    elif objective_name == "flow_transformer":
+        forward_fn = flow_transformer_forward
+    elif objective_name == "fjepa":
+        forward_fn = fjepa_forward
     elif objective_name == "shortcut":
         forward_fn = shortcut_forward
     else:

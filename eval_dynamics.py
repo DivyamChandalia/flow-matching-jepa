@@ -19,6 +19,25 @@ def collate_sequences(dataset, indices, device):
     return pixels, actions
 
 
+def _flow_single_step(model, ctx_emb, ctx_act, base_state, noise, nfe):
+    """One denoised next latent. Supports FlowJEPA (predictor-is-flow) and
+    ShortcutJEPA (AR context + small flow head) models."""
+    if hasattr(model, "sample_next_flow"):
+        return model.sample_next_flow(ctx_emb, ctx_act, noise=noise, nfe=nfe)
+    context = model.predict_context(ctx_emb, ctx_act)[:, -1:]
+    return model.sample_next_from_context(
+        context=context, base_state=base_state, noise=noise, nfe=nfe,
+    )
+
+
+def _is_flow_model(model):
+    return (
+        hasattr(model, "sample_next_from_context")
+        or hasattr(model, "sample_next_flow")
+        or hasattr(model, "flow_source")
+    )
+
+
 def _ar_rollout(model, ctx_emb, ctx_act, steps, history_size=3):
     """Autoregressive rollout using AR predictor only (no flow)."""
     pred_embs = []
@@ -135,7 +154,8 @@ def evaluate_ar_conditioning_shuffle(model, dataset, noise_seed=12345, num_sampl
 
 def evaluate_flow_dynamics(model, dataset, horizons, noise_seed=12345, num_samples=64, device="cuda", history_size=3, nfe=4):
     """Evaluate latent dynamics. Uses flow sampling if available, else AR predictor."""
-    is_flow = hasattr(model, "sample_next_from_context")
+    is_flow = _is_flow_model(model)
+    is_traj = hasattr(model, "flow_source")
     model = model.to(device).eval()
     model.requires_grad_(False)
     all_metrics = {h: {"mse": [], "cos_sim": []} for h in horizons}
@@ -155,15 +175,30 @@ def evaluate_flow_dynamics(model, dataset, horizons, noise_seed=12345, num_sampl
         for h in horizons:
             ctx_emb = emb[:, :history_size]
             ctx_act = act_emb[:, :history_size]
+            if is_traj:
+                # one-shot horizon prediction with oracle future actions
+                fut_act = act_emb[:, history_size - 1:history_size - 1 + h]
+                noise = torch.randn(B, h, emb.size(-1), generator=generator, device=device)
+                pred_embs = model.predict(ctx_emb, fut_act, horizon=h, noise=noise, num_steps=nfe)
+                true_embs = emb[:, history_size:history_size + h]
+                if true_embs.size(1) == 0:
+                    continue
+                mse = (pred_embs - true_embs).pow(2).mean().item()
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    pred_embs.reshape(-1, pred_embs.size(-1)),
+                    true_embs.reshape(-1, true_embs.size(-1)),
+                ).mean().item()
+                all_metrics[h]["mse"].append(mse)
+                all_metrics[h]["cos_sim"].append(cos_sim)
+                continue
             pred_embs = []
             for t in range(h):
                 _ctx_emb = ctx_emb[:, -history_size:]
                 _ctx_act = ctx_act[:, -history_size:]
                 noise = torch.randn(B, 1, emb.size(-1), generator=generator, device=device)
                 if is_flow:
-                    context = model.predict_context(_ctx_emb, _ctx_act)[:, -1:]
-                    pred = model.sample_next_from_context(
-                        context=context, base_state=_ctx_emb[:, -1:], noise=noise, nfe=nfe,
+                    pred = _flow_single_step(
+                        model, _ctx_emb, _ctx_act, _ctx_emb[:, -1:], noise, nfe,
                     )
                 else:
                     pred = model.predict(_ctx_emb, _ctx_act)[:, -1:]
@@ -196,7 +231,8 @@ def evaluate_flow_dynamics(model, dataset, horizons, noise_seed=12345, num_sampl
 
 def evaluate_flow_conditioning_shuffle(model, dataset, noise_seed=12345, num_samples=32, device="cuda", history_size=3, nfe=4):
     """Action/context shuffle test. Uses flow if available, else AR predictor."""
-    is_flow = hasattr(model, "sample_next_from_context")
+    is_flow = _is_flow_model(model)
+    is_traj = hasattr(model, "flow_source")
     model = model.to(device).eval()
     model.requires_grad_(False)
     normal_losses = []
@@ -219,11 +255,15 @@ def evaluate_flow_conditioning_shuffle(model, dataset, noise_seed=12345, num_sam
         ctx_act = act_emb[:, :history_size]
         true_emb = emb[:, history_size:history_size + 1]
         noise = torch.randn(B, 1, emb.size(-1), generator=generator, device=device)
-        if is_flow:
-            context = model.predict_context(ctx_emb, ctx_act)[:, -1:]
-            pred = model.sample_next_from_context(
-                context=context, base_state=ctx_emb[:, -1:], noise=noise, nfe=nfe,
+        if is_traj:
+            # one-shot single-step prediction (P=1)
+            fut_act = ctx_act[:, -1:]
+            pred = model.predict(
+                ctx_emb, fut_act, horizon=1,
+                noise=noise.expand(B, 1, emb.size(-1)), num_steps=nfe,
             )
+        elif is_flow:
+            pred = _flow_single_step(model, ctx_emb, ctx_act, ctx_emb[:, -1:], noise, nfe)
         else:
             pred = model.predict(ctx_emb, ctx_act)[:, -1:]
         normal_loss = (pred - true_emb).pow(2).mean().item()
@@ -231,22 +271,26 @@ def evaluate_flow_conditioning_shuffle(model, dataset, noise_seed=12345, num_sam
 
         perm = torch.randperm(B, device=device)
         ctx_act_shuf = ctx_act[perm]
-        if is_flow:
-            context_shuf = model.predict_context(ctx_emb, ctx_act_shuf)[:, -1:]
-            pred = model.sample_next_from_context(
-                context=context_shuf, base_state=ctx_emb[:, -1:], noise=noise, nfe=nfe,
+        if is_traj:
+            pred = model.predict(
+                ctx_emb, ctx_act_shuf[:, -1:], horizon=1,
+                noise=noise.expand(B, 1, emb.size(-1)), num_steps=nfe,
             )
+        elif is_flow:
+            pred = _flow_single_step(model, ctx_emb, ctx_act_shuf, ctx_emb[:, -1:], noise, nfe)
         else:
             pred = model.predict(ctx_emb, ctx_act_shuf)[:, -1:]
         shuffle_action_losses.append((pred - true_emb).pow(2).mean().item())
 
         perm = torch.randperm(B, device=device)
         ctx_emb_shuf = ctx_emb[perm]
-        if is_flow:
-            context_shuf = model.predict_context(ctx_emb_shuf, ctx_act)[:, -1:]
-            pred = model.sample_next_from_context(
-                context=context_shuf, base_state=ctx_emb_shuf[:, -1:], noise=noise, nfe=nfe,
+        if is_traj:
+            pred = model.predict(
+                ctx_emb_shuf, ctx_act, horizon=1,
+                noise=noise.expand(B, 1, emb.size(-1)), num_steps=nfe,
             )
+        elif is_flow:
+            pred = _flow_single_step(model, ctx_emb_shuf, ctx_act, ctx_emb_shuf[:, -1:], noise, nfe)
         else:
             pred = model.predict(ctx_emb_shuf, ctx_act)[:, -1:]
         shuffle_context_losses.append((pred - true_emb).pow(2).mean().item())
@@ -282,23 +326,16 @@ def evaluate_noise_sensitivity(model, dataset, num_samples=16, device="cuda", hi
         act_emb = info["act_emb"]
         ctx_emb = emb[:, :history_size]
         ctx_act = act_emb[:, :history_size]
-        context = model.predict_context(ctx_emb, ctx_act)[:, -1:]
         base_state = ctx_emb[:, -1:]
         noise_1 = torch.randn(B, 1, emb.size(-1), device=device)
         noise_2 = torch.randn(B, 1, emb.size(-1), device=device)
-        pred_1 = model.sample_next_from_context(
-            context=context, base_state=base_state, noise=noise_1, nfe=nfe,
-        )
-        pred_2 = model.sample_next_from_context(
-            context=context, base_state=base_state, noise=noise_2, nfe=nfe,
-        )
+        pred_1 = _flow_single_step(model, ctx_emb, ctx_act, base_state, noise_1, nfe)
+        pred_2 = _flow_single_step(model, ctx_emb, ctx_act, base_state, noise_2, nfe)
         noise_effects_1step.append((pred_1 - pred_2).pow(2).mean().item())
         all_preds = []
         for _ in range(8):
             n = torch.randn(B, 1, emb.size(-1), device=device)
-            p = model.sample_next_from_context(
-                context=context, base_state=base_state, noise=n, nfe=nfe,
-            )
+            p = _flow_single_step(model, ctx_emb, ctx_act, base_state, n, nfe)
             all_preds.append(p)
         stacked = torch.stack(all_preds, dim=0)
         pred_variances_8.append(stacked.var(dim=0).mean().item())
@@ -312,6 +349,7 @@ def evaluate_action_sensitivity(model, dataset, num_samples=16, device="cuda", h
     """Direct action sensitivity for both AR and flow outputs."""
     model = model.to(device).eval()
     model.requires_grad_(False)
+    has_ar = hasattr(model, "predict_context")
     ar_action_effects = []
     flow_action_effects = []
     rnd = np.random.RandomState(0)
@@ -328,24 +366,23 @@ def evaluate_action_sensitivity(model, dataset, num_samples=16, device="cuda", h
         ctx_emb = emb[:, :history_size]
         ctx_act = act_emb[:, :history_size]
         noise = torch.randn(B, 1, emb.size(-1), device=device)
-
-        ar_correct = model.predict_context(ctx_emb, ctx_act)[:, -1:]
         perm = torch.randperm(B, device=device)
-        ar_shuffled = model.predict_context(ctx_emb, ctx_act[perm])[:, -1:]
-        ar_action_effects.append((ar_correct - ar_shuffled).pow(2).mean().item())
 
-        context_correct = ar_correct
-        context_shuffled = model.predict_context(ctx_emb, ctx_act[perm])[:, -1:]
-        flow_correct = model.sample_next_from_context(
-            context=context_correct, base_state=ctx_emb[:, -1:], noise=noise, nfe=nfe,
+        if has_ar:
+            ar_correct = model.predict_context(ctx_emb, ctx_act)[:, -1:]
+            ar_shuffled = model.predict_context(ctx_emb, ctx_act[perm])[:, -1:]
+            ar_action_effects.append((ar_correct - ar_shuffled).pow(2).mean().item())
+
+        flow_correct = _flow_single_step(
+            model, ctx_emb, ctx_act, ctx_emb[:, -1:], noise, nfe,
         )
-        flow_shuffled = model.sample_next_from_context(
-            context=context_shuffled, base_state=ctx_emb[:, -1:], noise=noise, nfe=nfe,
+        flow_shuffled = _flow_single_step(
+            model, ctx_emb, ctx_act[perm], ctx_emb[:, -1:], noise, nfe,
         )
         flow_action_effects.append((flow_correct - flow_shuffled).pow(2).mean().item())
 
     return {
-        "ar_action_output_effect": float(np.mean(ar_action_effects)),
+        "ar_action_output_effect": float(np.mean(ar_action_effects)) if ar_action_effects else None,
         "flow_action_output_effect": float(np.mean(flow_action_effects)),
     }
 
@@ -365,8 +402,8 @@ def _resolve_dataset_path(name, cfg):
 
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
-    history_size = 3
-    horizons = [1, 3, 5]
+    history_size = cfg.eval.get("history_size", 3)
+    horizons = [1, 3, 5, 10, 15]
     num_steps = history_size + max(horizons)
 
     dataset_name = _resolve_dataset_path(cfg.eval.dataset_name, cfg)
@@ -392,7 +429,13 @@ def run(cfg: DictConfig):
     model = model.to(device).eval()
     model.requires_grad_(False)
 
-    is_flow_model = hasattr(model, "sample_next_from_context")
+    is_flow_model = _is_flow_model(model)
+    has_ar = hasattr(model, "predict_context")
+    has_step_api = (
+        hasattr(model, "predict_context")
+        or hasattr(model, "sample_next_from_context")
+        or hasattr(model, "sample_next_flow")
+    )
     if is_flow_model:
         sampling_cfg = cfg.get("sampling", {})
         model.configure_sampling(
@@ -407,23 +450,25 @@ def run(cfg: DictConfig):
     results = {}
 
     if is_flow_model:
-        print("=== AR (deterministic) dynamics ===")
-        ar_dynamics = evaluate_ar_dynamics(
-            model, dataset, horizons=horizons, noise_seed=12345, num_samples=64, device=device,
-        )
-        print(json.dumps(ar_dynamics, indent=2, default=str))
-        results["ar_dynamics"] = ar_dynamics
+        if has_ar:
+            print("=== AR (deterministic) dynamics ===")
+            ar_dynamics = evaluate_ar_dynamics(
+                model, dataset, horizons=horizons, noise_seed=12345, num_samples=64, device=device,
+            )
+            print(json.dumps(ar_dynamics, indent=2, default=str))
+            results["ar_dynamics"] = ar_dynamics
 
-        print("=== AR conditioning shuffle ===")
-        ar_shuffle = evaluate_ar_conditioning_shuffle(
-            model, dataset, noise_seed=12345, num_samples=32, device=device,
-        )
-        print(json.dumps(ar_shuffle, indent=2, default=str))
-        results["ar_conditioning"] = ar_shuffle
+            print("=== AR conditioning shuffle ===")
+            ar_shuffle = evaluate_ar_conditioning_shuffle(
+                model, dataset, noise_seed=12345, num_samples=32, device=device,
+            )
+            print(json.dumps(ar_shuffle, indent=2, default=str))
+            results["ar_conditioning"] = ar_shuffle
 
         print(f"=== Flow dynamics (NFE={use_nfe}) ===")
         flow_dynamics = evaluate_flow_dynamics(
             model, dataset, horizons=horizons, noise_seed=12345, num_samples=64, device=device, nfe=use_nfe,
+            history_size=history_size,
         )
         print(json.dumps(flow_dynamics, indent=2, default=str))
         results["flow_dynamics"] = flow_dynamics
@@ -431,35 +476,43 @@ def run(cfg: DictConfig):
         print("=== Flow conditioning shuffle ===")
         flow_shuffle = evaluate_flow_conditioning_shuffle(
             model, dataset, noise_seed=12345, num_samples=32, device=device, nfe=use_nfe,
+            history_size=history_size,
         )
         print(json.dumps(flow_shuffle, indent=2, default=str))
         results["flow_conditioning"] = flow_shuffle
 
         print("=== Noise sensitivity ===")
-        noise = evaluate_noise_sensitivity(
-            model, dataset, num_samples=16, device=device, nfe=use_nfe,
-        )
+        if has_step_api:
+            noise = evaluate_noise_sensitivity(
+                model, dataset, num_samples=16, device=device, nfe=use_nfe,
+            )
+        else:
+            noise = {"note": "single-step API unsupported for one-shot trajectory model"}
         print(json.dumps(noise, indent=2, default=str))
         results["noise_sensitivity"] = noise
 
         print("=== Action sensitivity ===")
-        action_sens = evaluate_action_sensitivity(
-            model, dataset, num_samples=16, device=device, nfe=use_nfe,
-        )
+        if has_step_api:
+            action_sens = evaluate_action_sensitivity(
+                model, dataset, num_samples=16, device=device, nfe=use_nfe,
+            )
+        else:
+            action_sens = {"note": "single-step API unsupported for one-shot trajectory model"}
         print(json.dumps(action_sens, indent=2, default=str))
         results["action_sensitivity"] = action_sens
 
-        ar_1 = ar_dynamics.get("1", {}).get("mse_mean", 0)
-        flow_1 = flow_dynamics.get("1", {}).get("mse_mean", 0)
-        flow_gain = (ar_1 - flow_1) / ar_1 if ar_1 > 0 else 0
-        results["flow_gain"] = flow_gain
-        print(f"=== Flow gain (1-step): {flow_gain:.4f} (positive = flow improves over AR) ===")
+        if has_ar:
+            ar_1 = ar_dynamics.get("1", {}).get("mse_mean", 0)
+            flow_1 = flow_dynamics.get("1", {}).get("mse_mean", 0)
+            flow_gain = (ar_1 - flow_1) / ar_1 if ar_1 > 0 else 0
+            results["flow_gain"] = flow_gain
+            print(f"=== Flow gain (1-step): {flow_gain:.4f} (positive = flow improves over AR) ===")
 
-        print("=== AR vs Flow comparison ===")
-        ar_act_ratio = ar_shuffle.get("action_shuffle_ratio", 0)
-        flow_act_ratio = flow_shuffle.get("action_shuffle_ratio", 0)
-        print(f"  AR action ratio: {ar_act_ratio:.4f}")
-        print(f"  Flow action ratio: {flow_act_ratio:.4f}")
+            print("=== AR vs Flow comparison ===")
+            ar_act_ratio = ar_shuffle.get("action_shuffle_ratio", 0)
+            flow_act_ratio = flow_shuffle.get("action_shuffle_ratio", 0)
+            print(f"  AR action ratio: {ar_act_ratio:.4f}")
+            print(f"  Flow action ratio: {flow_act_ratio:.4f}")
     else:
         print("=== Deterministic (MSE) dynamics ===")
         results["dynamics"] = evaluate_flow_dynamics(
